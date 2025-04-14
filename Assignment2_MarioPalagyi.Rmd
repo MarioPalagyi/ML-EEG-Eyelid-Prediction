@@ -1,0 +1,449 @@
+---
+title: "Assignment 2"
+author: "Mario Palagyi"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::robobook:
+    highlight: kate
+    code_folding: hide
+---
+"Your task is to train a classifier in R that based on EEG sensor data is capable of predicting whether a patient has eyelids open or closed."
+
+```{r, warning=FALSE, message=FALSE}
+if (rstudioapi::isAvailable()) {
+  setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+}
+
+# Load libraries ---------------------------------------------------------------
+# Create our function "using()" 
+using <- \(pkg) {
+  # if a package is not installed, install it
+  if (!rlang::is_installed(pkg)) {
+    install.packages(pkg, repo = "https://cloud.r-project.org")
+  }
+  # load the package
+  library(pkg, character.only = TRUE)
+}
+
+using("data.table")
+using("plotly") 
+using("caret")
+using("rpart")
+using("rpart.plot")
+using("ranger") 
+using("adabag") 
+using("xgboost") 
+using("imbalance") # Oversampling
+using("ROSE") # Synthetic generation of new data to rebalance
+using("e1071") # for building SVM model
+using("class") #knn implementation
+using("mltools") # for xgboost
+```
+# EEG Data
+
+## 1. Data importing
+**Description:** Import the EEG data from the attachments in this assignment. The dataset contains
+- 16 EEG numerical features
+- 1 label (0-open | 1-closed)
+(Train and test are already split (eeg_training.csv, eeg_test.csv))
+
+```{r}
+training <- fread("./data/eeg_eyelid_training.csv")
+testing <- fread("./data/eeg_eyelid_test.csv")
+
+nrow(training) / (nrow(testing) + nrow(training))
+```
+Note: Split is about ~70-30
+
+
+## 2. Shortly explore the dataset (EDA), perform data cleansing and preprocessing.
+```{r}
+str(training)
+summary(training)
+```
+
+
+```{r}
+#setnames(training, "Class", "eyes_state")
+#setnames(testing, "Class", "eyes_state")
+#training[, eyes_state := ifelse(eyes_state == "1-closed", "closed", "open") ]
+#testing[, eyes_state := ifelse(eyes_state == "1-closed", "closed", "open") ]
+#training[, eyes_state := as.factor(eyes_state)]
+#testing[, eyes_state := as.factor(eyes_state)]
+#str(training)
+
+clean_data_fun <- function(data) {
+  setnames(data, "Class", "eyes_state")
+  data[, eyes_state := ifelse(eyes_state == "1-closed", "closed", "open") ]
+  data[, eyes_state := as.factor(eyes_state)]
+  
+  return(data)
+}
+testing <- clean_data_fun(testing)
+training <- clean_data_fun(training)
+```
+I renamed the "Class" column to something more descriptive "eyes_state", where the past "1-closed" and "0-open" are translated to closed and open appropriately.
+
+I also created a separate function which does basic cleaning. 
+
+
+Handling missing data
+```{r}
+# missing values in training?
+any(is.na(training))
+colSums(is.na(training))
+
+# missing values in testing?
+any(is.na(testing))
+
+# compare ratio of omitting all rows with NAs to how many rows we have
+length(na.omit(training$EEG6))/ nrow(training) # had to use length, since filtering for EEG6 makes it a vector
+
+training[, "EEG6" := NULL]; testing[, "EEG6" := NULL]
+
+nrow(na.omit(training))/ nrow(training)
+colSums(is.na(training)) # some missing values in EEG3 and 9
+
+which(is.na(training$EEG3), arr.ind = TRUE) # 80  640 2331 2585 2731 3296 3466 5747 6834
+
+colSums(is.na(training))
+
+training[is.na(EEG3), EEG3 := median(training[,EEG3], na.rm = T)]
+training[is.na(EEG9), EEG9 := median(training[,EEG9], na.rm = T)]
+
+colSums(is.na(training))
+```
+
+What I did:
+
+- I noticed that there are lots of missing values in the column "EEG6", it affected most rows with EEG6, so I decided to remove that whole column from both datasets.
+- There were still rows containing missing values in the training dataset, so I imputed the median
+
+(**Note to self**: How to know if missing data is truly random or not? How to find out that what we remove doesn't contain important patterns?)
+
+
+```{r}
+
+my_numerical_columns <- colnames(training[, .SD, .SDcols = is.numeric]) #names of numerical cols
+boxplots <- lapply(my_numerical_columns,
+                  function(col) {
+                    plot_ly(data = training,
+                           x = ~eyes_state,
+                           y = ~get(col),
+                           color = ~eyes_state,
+                           colors = c("Red","Blue"),
+                           type = "box",
+                           showlegend = FALSE) |>
+                      layout(yaxis = list(title = col))
+                  })
+subplot(boxplots, titleY = T, nrows = 4, margin = 0.2)
+```
+From the summary of the training dataset, we might notice, that there are some apparent outliers in there, which we can also see in the boxplots. Those which are smushed have big outliers.
+
+In the next section, I propose an outlier handling code, but I'm not sure it's 100% appropriate. My main difficulty is where do you draw the line between an outlier you can leave in, that won't have that much affect and an outlier that will cause problems.
+```{r}
+# Removing outliers
+#outlier_handler <- function(col) {
+#  if (is.numeric(col)) {
+#    Q1 <- quantile(col, 0.25, na.rm = TRUE)
+#    Q3 <- quantile(col, 0.75, na.rm = TRUE)
+#    IQR_val <- Q3 - Q1
+#    lower <- Q1 - 3 * IQR_val # * 3 not to lose so much data
+#    upper <- Q3 + 3 * IQR_val
+#    col[col < lower | col > upper] <- NA  # Replace outliers with NA, for easy omitting
+#  }
+#  return(col)
+#}
+
+# lapply to all EEG columns
+#training[, 1:16] <- lapply(training[, 1:16], outlier_handler)
+#summary(training)
+# testing didn't have a huge outlier problem
+#summary(testing)
+```
+
+
+## 3. Train a classifier that predicts whether the patient has closed eyelids (positive class = closed eyelids).
+- Part 1: Train a classifier using Decision Trees.
+- Part 2: Train a classifier using SVM.
+- Part 3: Train a classifier using KNN.
+- Part 4: Train classifiers using Random Forest, AdaBoost, and XGBoost.
+(if/where appropriate perform hyperparameters tuning)
+
+### Part 1: Decision Trees
+
+```{r}
+# Decision Trees ------------------------------------------------------------
+# Default parameter tree
+dtree_default <- rpart::rpart(eyes_state ~ ., method = "class", 
+                              data =training)
+
+#rpart.plot(dtree_default, type = 2, extra = 101, fallen.leaves = F, 
+#           main = "Decision Tree for eye_state")
+printcp(dtree_default)
+plotcp(dtree_default)
+
+# Full tree
+dtree_full <- rpart::rpart(eyes_state ~ ., method = "class", 
+                           data =training,
+                           control = rpart.control(minsplit = 1, cp = 0))
+
+#rpart.plot(dtree_full, type = 2, extra = 101, fallen.leaves = F, 
+#           main = "Complete Decision Tree for eye_state")
+which.min(dtree_full$cptable[, "xerror"]) # 27
+printcp(dtree_full)
+plotcp(dtree_full)
+
+# Optimal tree
+prune_optimal <- dtree_full$cptable[which.min(dtree_full$cptable[, "xerror"]), "CP"]
+dtree_optimal <- prune(dtree_full, cp = prune_optimal)
+
+#rpart.plot(dtree_optimal, type = 2, extra = 101, fallen.leaves = F, 
+#           main = "Pruned Classification Tree for Seeds")
+printcp(dtree_optimal)
+plotcp(dtree_optimal)
+
+```
+
+**Hyperparameter tuning** was carried out the same way as in Assignment 1, with default decision tree first, then the full decision tree and from that, the final pruned tree.
+
+This model's performance is not so good, even with hyperparameter tuning, but we'll see how it compares to the rest later.
+
+
+```{r}
+training[, .N, eyes_state] # closed eye_state is undersampled
+```
+
+We can see the closed eye state is somewhat undersampled, so we need to keep an eye on models that might focus too heavily on "open" outcomes.
+
+
+```{r}
+# Confusion Matrix and relevant metrics
+training_x <- training[, !"eyes_state"]
+training_y <- training[, eyes_state]
+testing_x <- testing[, !"eyes_state"]
+testing_y <- testing[, eyes_state]
+
+predict_y_dtree_optimal <- predict(dtree_optimal, newdata = testing_x, type = "class")
+
+table(predict_y_dtree_optimal, testing_y) # raw confusion matrices
+
+dctree_cm<- confusionMatrix(predict_y_dtree_optimal, reference=testing_y, mode="prec_recall")
+confusionMatrix(predict_y_dtree_optimal, reference=testing_y, mode="prec_recall")
+```
+We can see that the model's performance is okay, it has good accuracy and precision, but recall is bad
+
+
+### Part 2: Support Vector Machines
+```{r}
+# SVM -----------------------------------------------------------------------
+#library(e1071)
+# We evaluate each kernel
+evaluate_kernel_fun <- function(type) {
+  svm_model <- svm(eyes_state ~ ., 
+               data = training,
+               kernel = type,
+               type = "C-classification")
+  
+  pred <- predict(svm_model, testing)
+  cmatrix <- confusionMatrix(pred, testing$eyes_state)
+  return(cmatrix$overall['Accuracy'])
+}
+
+kernels <- c("linear", "polynomial", "radial", "sigmoid")
+results <- sapply(kernels, evaluate_kernel_fun)
+
+data.frame(Kernel = kernels, Accuracy = results)
+```
+
+As we can see, the highest accuracy model is the RBF, so we'll go with that one.
+
+```{r}
+# Training with a smaller size
+small_train <- training[sample(nrow(training), 2000), ]
+
+# class balance
+small_train[, .N, eyes_state]
+
+# radial kernel performed best, tune with that kernel
+tuning_rbf <- tune.svm(eyes_state ~ .,
+                   data = small_train,
+                   kernel = "radial",
+                   cost = c(0.01, 0.1, 1, 10, 100),
+                   gamma = 5*10^(-2:2))
+
+# create model with the correct kernel and parameters
+best_svm_model <- svm(eyes_state ~ ., 
+                     data = small_train, 
+                     type = "C-classification",
+                     kernel = "radial",  # Using radial since it performed best
+                     cost = tuning_rbf$best.parameters$cost,
+                     gamma = tuning_rbf$best.parameters$gamma,
+                     scale = TRUE)
+
+pred_test <- predict(best_svm_model, testing)
+accuracy <- mean(pred_test == testing$eyes_state)
+accuracy
+
+svm_cm <- confusionMatrix(data = factor(pred_test), 
+                      reference = factor(testing$eyes_state), 
+                      mode = "prec_recall")
+confusionMatrix(data = factor(pred_test), 
+                      reference = factor(testing$eyes_state), 
+                      mode = "prec_recall")
+
+```
+By using a sample size of 2000 and RBF as my kernel, I managed to develop a better model, with high F1 score and Precision, but Recall is pretty bad
+In comparison to the decision tree, this is still an improvement improvement.
+
+
+### Part 3: KNN
+```{r}
+# KNN ----------------------------------------------------------------
+k <- seq(1, 55, 2)
+knn <- lapply(k, \(x) knn.cv(train = training_x, cl = training_y, k = x))
+
+accuracies <- sapply(knn, \(x) confusionMatrix(data = x, reference = training_y)$overall["Accuracy"])
+plot_ly(x = k, y = accuracies, type = "scatter", mode = "line")
+
+knn_cm <- confusionMatrix(data = knn[[((5-1)/2)]], reference = training_y, mode="prec_recall")
+#Note for self: knn[[2]] accesses the second element in list of KNN models
+
+```
+I choose k as 3 for the optimal value, because that is the "elbow point", after which increasing the k-value doesn't provide as good of an improvement. That's where my graph goes sharply downward and has high accuracy.
+We can see in the confusion matrix, that high relevant values: Kappa, Precision, Recall and F1 value (also Balanced Accuracy) have produced high results.
+We can say that this model works well for our case.
+
+### Part 4: Random Forest, AdaBoost, and XGBoost.
+
+**Random Forest**
+```{r}
+# RF --------------------------------------------------------------------
+rf.orig <- ranger(x = training_x, y = training_y)
+rf.orig
+#confusionMatrix(data=rf.orig$predictions, reference = training_y, 
+#                mode="prec_recall")
+
+my_pred <- predict(object = rf.orig, data = testing_x)
+rf_cm <- confusionMatrix(data = my_pred$predictions, reference = testing_y, mode = "prec_recall")
+confusionMatrix(data = my_pred$predictions, reference = testing_y, mode = "prec_recall")
+```
+As we can see, we have **pretty good prediction precision**, but our **recall is not exactly good**, this means that the model probably realised that we have more "open" data and it defaults to predicting that state to achieve high results.
+
+
+We need to rebalance for Random Forest
+```{r, warning=FALSE}
+training.rose <- ovun.sample(eyes_state ~ ., data = training,
+                              method = "over", seed = 123, p = 0.4)$data
+setDT(training.rose)
+training[, .N, eyes_state]
+training.rose[, .N, eyes_state]
+training.rose_x <- training.rose[,!"eyes_state"]
+training.rose_y <- training.rose[, eyes_state]
+
+rf.rebalanced <- ranger(x = training.rose_x, y= training.rose_y) # with default parameters
+
+confusionMatrix(data = rf.rebalanced$predictions, reference = training.rose_y,
+                mode = "prec_recall")
+
+my_pred_reb <- predict(rf.rebalanced, data = testing_x)
+rf.re_cm <- confusionMatrix(data = my_pred_reb$predictions, reference = testing_y,
+                mode = "prec_recall")
+confusionMatrix(data = my_pred_reb$predictions, reference = testing_y,
+                mode = "prec_recall")
+```
+We managed to marginally improve Recall by resampling.
+
+**Feature importance test**
+```{r}
+# Feature importance
+training.rose[, random:=runif(nrow(training.rose), 1, 100)]
+fit.ranger <- ranger(eyes_state ~ ., data = training.rose, importance = "permutation")
+imp <- importance(fit.ranger)
+imp <- data.table(Feature = names(imp), importance = imp)
+plot_ly(data=imp, x=~Feature, y=~importance, type="bar") %>%
+  layout(xaxis = list(categoryorder="total descending"))
+# Confirmed. We can remove the random feature
+training.rose[, random :=NULL]
+```
+We can see that EEG3, EEG5 and EEG16 are the top 3 most important features regarding model performance. Introducing a random sample makes it get to the end of the importances, which is good.
+
+**AdaBoost**
+```{r}
+ada <- adabag::boosting(eyes_state ~ ., data = training.rose, mfinal = 200)
+my_pred_adaboost <- predict(ada, newdata = testing_x)
+ada_cm <- confusionMatrix(as.factor(my_pred_adaboost$class), testing_y, mode = "prec_recall")
+confusionMatrix(as.factor(my_pred_adaboost$class), testing_y, mode = "prec_recall")
+```
+
+From the confusion matrix of AdaBoost, it's obvious that this is a better fitting model, since **Accuracy and Precision** are high, but **Recall** isn't low either.
+
+**XGBoost**
+```{r}
+# We already have all columns in numerical type, which XGBoost requires
+# make sure to use matrix and have 0, 1 in categorical
+training.rose_y_xgb <- as.numeric(training.rose_y == "closed")
+
+# Train XGBoost model
+xgb_model <- xgboost(data = as.matrix(training.rose_x),
+                    label = training.rose_y_xgb,
+                    nrounds = 300,        # Start with fewer rounds to avoid overfitting
+                    objective = "binary:logistic",
+                    eval_metric = "error",
+                    verbose = 0)
+
+test_matrix <- as.matrix(testing_x)
+xgb_pred_prob <- predict(xgb_model, test_matrix)
+xgb_pred_class <- ifelse(xgb_pred_prob > 0.5, "closed", "open") # we assign label, because XGBoost is a regression algorithm
+
+# Convert to factor with the same levels as testing_y for confusionMatrix
+xgb_pred_factor <- factor(xgb_pred_class, levels = levels(testing_y))
+
+# Evaluate model performance
+xgb_cm <- confusionMatrix(data = xgb_pred_factor, 
+                                  reference = testing_y,
+                                  mode = "prec_recall")
+confusionMatrix(data = xgb_pred_factor, 
+                                  reference = testing_y,
+                                  mode = "prec_recall")
+```
+By interpreting the confusion matrix of XGBoost, we see that **Accuracy and Precision** are high, but **Recall is lacking** again.
+
+
+## 4. Display a table summarizing the performance of all models on the training and on the test set (Accuracy, Precision, Recall, and F1-Score)
+```{r}
+# The confusion matrices in question:
+# dctree_cm,
+# - svm_cm,
+# - knn_cm,
+# - rf_cm,
+# - rf.re_cm,
+# - ada_cm,
+# - xgb_cm
+
+# A function that extracts metrics from the confusion Matrices
+get_metrics <- function(matrix) {
+  accuracy <- matrix$overall['Accuracy']
+  precision <- matrix$byClass['Precision']
+  recall <- matrix$byClass['Recall']
+  f1 <- matrix$byClass['F1']
+  return(c(accuracy, 
+           precision, 
+           recall, 
+           f1))}
+  
+# Extracting the appropriate metric using the function
+metrics <- list(
+  DecisionTree = get_metrics(dctree_cm),
+  SVM          = get_metrics(svm_cm),
+  KNN          = get_metrics(knn_cm),
+  RF = get_metrics(rf_cm),
+  RF_Re        = get_metrics(rf.re_cm),
+  AdaBoost     = get_metrics(ada_cm),
+  XGBoost      = get_metrics(xgb_cm)
+)
+
+performance_table <- as.data.frame(do.call(rbind, metrics)) # we can use do.call for a list of arguments here
+performance_table
+```
+Based on this **final** table summarizing the results, we can conclude that the overall best model for this problem is **most likely KNN**, as that was the most consistent among all metrics.
